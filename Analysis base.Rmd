@@ -1,0 +1,2010 @@
+---
+title: "Markov PC"
+author: "Jiaqi Wang"
+date: "2024-12-03"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyr))
+suppressMessages(library(data.table))
+suppressMessages(library(gdata))
+suppressMessages(library(ggplot2))
+
+suppressMessages(library(mstate))
+suppressMessages(library(msm))
+suppressMessages(library(flexsurv))
+
+
+
+## function
+records_check <- function(df){
+  df %>% left_join(pc_popu %>% transmute(Reference_Key, cohort), by = "Reference_Key") %>% 
+  group_by(cohort) %>% summarize(n_popu = n_distinct(Reference_Key), n_rec = max(row_number()))
+}
+
+fill0 <- function(vec){
+  vec[is.na(vec)] <- 0
+  return(vec)
+}
+
+```
+
+
+# Part A: Define event from the raw records
+
+
+## Dx
+
+Find diagnosis of PC (ICD-9-CM: 185) and secondary malignent cancer(ICD-9-CM: 196, 197, 198, 199).
+
+```{r}
+load("./data/combined/Dx_total.Rda")
+
+#####
+
+dx_raw <- df %>% transmute(Reference_Key, date = as.Date(Reference_Date),
+                           diag_code = trim(`All_Diagnosis_Code_(ICD9)`), diag_code_n = as.numeric(diag_code),
+                           patient_type = `Patient_Type_(IP/OP/A&E)`,
+                           birthdate = as.Date(`Date_of_Birth_(yyyy-mm-dd)`)) %>% 
+  filter((diag_code %in% c("185")) | (diag_code_n<=199 & diag_code_n >= 196)) %>% 
+  mutate(event_dx = ifelse(diag_code_n == 185, "nm", "m"))
+
+```
+
+Read death data, and exclude:
+
+- metastasis before initial diagnosis of PC;
+- death before metastasis or pc;
+
+```{r}
+#####
+load("./data/combined/Death_total.Rda")
+death_raw <- df
+
+pc_popu <- dx_raw %>% group_by(Reference_Key, event_dx) %>% 
+  transmute(Reference_Key, date, event_dx) %>% 
+  filter(date == min(date)) %>% unique() %>% 
+  union(death_raw %>% transmute(Reference_Key, 
+                                date = as.Date(Date_of_Registered_Death), 
+                                event_dx = "death") %>% 
+          filter(!is.na(date))) %>% 
+  pivot_wider(names_from = event_dx, names_prefix = "date_", values_from = date) %>% 
+  filter(((is.na(date_m) & (is.na(date_death) | date_nm < date_death)) | (date_nm < date_m & (is.na(date_death) | date_m < date_death)))) %>% 
+  mutate(cohort = substr(date_nm,1,4))
+```
+
+
+```{r}
+pc_popu %>% group_by(cohort) %>% summarise(n = n_distinct(Reference_Key))
+
+```
+
+Mark time-to-event data using non-metastasis and metastasis from dx records before date of death.
+
+```{r}
+event_dx <- dx_raw %>% 
+  right_join(pc_popu %>% 
+               transmute(Reference_Key, cohort,
+                         indexdate = date_nm,
+                         deathdate = date_death),
+             by = "Reference_Key") %>% 
+  filter(date < deathdate | is.na(deathdate)) %>% 
+  transmute(Reference_Key, cohort, date, event_dx, indexdate) %>% group_by(Reference_Key, date) %>% 
+  transmute(Reference_Key, date, event = ifelse(n_distinct(event_dx) > 1, "m", event_dx)) %>% 
+  left_join(pc_popu %>% 
+              transmute(Reference_Key, date_m), by = "Reference_Key") %>% 
+  transmute(Reference_Key,date,event = ifelse(!is.na(date_m) & event == "nm" & date >= date_m, "m", event)) %>% 
+  unique() %>% arrange(Reference_Key, date)
+
+## checking
+event_dx %>% group_by(Reference_Key, date) %>% 
+  filter(max(row_number()) > 1)
+
+event_dx %>% filter(is.na(event))
+
+records_check(event_dx)
+```
+
+## Lab
+
+Marking CR from PSA and testosterone test results. 
+Making stable from PSA.
+
+### CR
+
+Castration Resistance patients should have PSA test results as:
+  
+- PSA > 2 ng/ml;
+- 3 consecutive increases in PSA, with ≥ 1 week gap;
+- 2 increases of 50% over nadir *controversial issue here*.
+
+(P.S. In the code explanation, some description use the word $Recovery$, it is a previous version of stable stage to describe a continuous low PSA situation.)
+
+For those PSA records met with related Castration Resistance definition, if the testosterone < 1.7 nmol/L at the same date, then it is marked as CR.
+
+```{r}
+load("./data/combined/Lab_PSA_total.rda")
+
+psa_raw <- df %>% transmute(Reference_Key, 
+                            lab_date = as.Date(substr(LIS_Reference_Datetime,1,10)),
+                            lab_res = as.numeric(LIS_Result_Numeric_Result),
+                         LIS_Test_Description) %>% unique() %>% 
+  filter(!is.na(lab_res)) %>% 
+  arrange(Reference_Key, lab_date, LIS_Test_Description) %>% 
+  group_by(Reference_Key, lab_date) %>% 
+  filter(row_number() == 1)
+
+findCR <- function(){
+  # split into increasing episode
+  psa_episode <- psa_raw %>% 
+    arrange(Reference_Key,lab_date) %>% 
+    group_by(Reference_Key) %>% 
+    mutate(ins_fl = (lab_res < lag(lab_res) | is.na(lag(lab_res)))) %>% 
+    transmute(Reference_Key,lab_date,lab_res,episode = cumsum(ins_fl))
+  
+  # in each episode should have more than 3 records (> 2)
+  psa_increase_temp <- psa_episode  %>% 
+    filter(lab_res > 2) %>% 
+    group_by(Reference_Key,episode) %>% 
+    filter(max(row_number()) >= 3) %>% 
+    mutate(odr = row_number())
+  
+  # nadir
+  temp_nadir <- psa_increase_temp %>% 
+    group_by(Reference_Key, episode) %>% 
+    filter(lab_date == min(lab_date)) %>% 
+    transmute(Reference_Key, episode, 
+              nadir_date = lab_date, nadir_value = lab_res)
+  
+  # middle records if gap >= 7
+  temp_middle <- psa_increase_temp %>% filter(odr > 1) %>% 
+    left_join(temp_nadir, by = c("Reference_Key", "episode")) %>% 
+    filter(lab_date - nadir_date >= 7) # only keep gap >= 7 records
+  
+  # triple records if hap >=7
+  temp_tripal <- temp_middle %>% filter(odr > min(odr)) %>% 
+    left_join(temp_middle %>% filter(odr == min(odr)) %>% 
+                transmute(Reference_Key, episode, 
+                          middle_date = lab_date, 
+                          middle_value = lab_res),
+              by = c("Reference_Key", "episode")) %>% 
+    filter(lab_date - middle_date >= 7) 
+  
+  # CR if the triple records satisfy two 0.5 increase
+  temp_cr <- temp_tripal %>% 
+    filter(odr == min(odr)) %>% 
+    filter(lab_res - middle_value > 0.5 * nadir_value & middle_value - nadir_value > 0.5 * nadir_value) 
+  
+  # keep records after the triple record
+  temp_tripal %>% 
+    filter(odr > min(odr) & middle_value - nadir_value > 0.5 * nadir_value )%>% 
+    left_join(temp_cr %>% 
+                transmute(Reference_Key, episode, 
+                          cr_date = lab_date, cr_value = lab_res), by = c("Reference_Key", "episode")) %>% 
+    filter(!is.na(cr_date) & lab_date > cr_date) %>% 
+    transmute(Reference_Key, lab_date, lab_res, episode, odr,
+              nadir_date, nadir_value, middle_date, middle_value) %>% 
+    union(temp_cr) %>% 
+    pivot_longer(c(nadir_date, middle_date, lab_date),
+                     names_to = "cate_date", values_to = "lab_date") %>% 
+    pivot_longer(c(nadir_value, middle_value, lab_res),
+                 names_to = "res_cate", values_to = "lab_value") %>% 
+    filter(substr(cate_date,1,4) == substr(res_cate,1,4)) %>% unique() %>% 
+    transmute(Reference_Key, episode, lab_date, lab_value) %>% 
+    unique() %>% 
+    arrange(Reference_Key, lab_date)
+}
+CR_psa_raw <- findCR()
+```
+
+
+
+
+
+```{r}
+### test
+load("./data/combined/Lab_tstst_total.rda")
+ttr_raw <- df
+
+# setting period for potential CR by tstst results
+CR_tstst_raw <- ttr_raw %>% filter(!is.na(Reference_Key)) %>% 
+  transmute(Reference_Key, 
+            date_tst = as.Date(substr(LIS_Reference_Datetime,1,10)),
+            res_tstst = as.numeric(LIS_Result_Numeric_Result)) %>% 
+  unique()
+
+
+# combine
+event_CR <- CR_psa_raw %>% 
+  group_by(Reference_Key,episode) %>% 
+  transmute(Reference_Key,episode,lab_date,
+            CR_psa_start = min(lab_date),
+            CR_psa_end = max(lab_date)) %>% unique() %>% 
+  unique() %>% 
+  left_join(CR_tstst_raw %>% filter(res_tstst < 1.7), by = "Reference_Key") %>% 
+  mutate(event = ifelse(!is.na(date_tst) & date_tst >= CR_psa_start & date_tst <= CR_psa_end,
+                        "CR", NA)) %>% 
+  filter(event == "CR") %>% 
+  pivot_longer(c(lab_date, date_tst), values_to = "date") %>% ungroup() %>% 
+  transmute(Reference_Key,date,event) %>% unique()
+
+# checking
+records_check(event_CR)
+```
+
+### RC
+
+The stable stage are also defined by the PSA results:
+
+- find records with PSA < 0.2 nmol/L;
+- filter out those have PSA >= 0.2 nmol/L within 6 months after the records date.
+
+```{r}
+event_RC <- psa_raw %>% 
+  arrange(Reference_Key, lab_date) %>% 
+  group_by(Reference_Key) %>% 
+  mutate(RC_flag = lab_res < 0.2,
+         cont_fl = RC_flag & (RC_flag != lag(RC_flag) | row_number() == 1)) %>% 
+  filter(RC_flag == T) %>% 
+  transmute(Reference_Key,
+            lab_date, lab_res,
+            episode = cumsum(cont_fl)) %>% 
+  group_by(Reference_Key, episode) %>% 
+  filter(max(lab_date) - min(lab_date) > 180) %>% ungroup() %>% 
+  transmute(Reference_Key, date = lab_date, event = "RC")
+
+## check
+records_check(event_RC)
+
+event_CRRC <- rbind(event_CR, event_RC)
+
+```
+
+## Union diagnosis with CR & stable
+
+### Define HNPC and mHSPC from Dx
+
+- HNPC: initial states, no or before metastasis/CR/stable happens;
+- mHSPC: metastasis before no or before metastasis/CR/stable happens.
+
+```{r DX_event}
+state_dx <- event_dx %>% 
+  left_join(event_CRRC %>% 
+              filter(event == "CR") %>% 
+              left_join(pc_popu, by = "Reference_Key") %>% 
+              filter(date > date_nm) %>% 
+              group_by(Reference_Key) %>% 
+              transmute(Reference_Key,
+                        CR_date = min(date)) %>% 
+              unique(),
+            by = "Reference_Key") %>% 
+  left_join(event_CRRC %>% 
+              filter(event == "RC") %>% 
+              left_join(pc_popu, by = "Reference_Key") %>% 
+              filter(date > date_nm) %>% 
+              transmute(Reference_Key,
+                        RC_date = date) %>% 
+              group_by(Reference_Key) %>% 
+              filter(RC_date == min(RC_date)) %>% 
+              unique() , by = "Reference_Key") %>% 
+  filter((date < RC_date | is.na(RC_date)) & (date < CR_date | is.na(CR_date))) %>% 
+  mutate(CRRC_date = as.Date(ifelse(is.na(CR_date), RC_date, ifelse(CR_date < RC_date, CR_date, RC_date)))) %>% 
+  transmute(Reference_Key,date,
+            event = ifelse(is.na(CRRC_date) | date < CRRC_date,
+                           ifelse(event == "nm", "HNPC", "mHSPC"),NA)) %>% 
+  filter(!is.na(event)) %>% 
+  unique()
+
+## checking
+state_dx %>% group_by(Reference_Key, date) %>% filter(max(row_number()) > 1)
+
+records_check(state_dx)
+```
+
+### Define (m)CR and (m) stable stage from Lab
+
+- CR/stable stage happens before metastasis -> CR/stable stage;
+- CR/stable stage happens after metastasis -> mCR/mstable stage
+
+```{r}
+state_lab <- event_CRRC %>% 
+  left_join(event_dx %>% 
+              filter(event == "m") %>% 
+              group_by(Reference_Key) %>% 
+              transmute(Reference_Key,
+                        mdate = min(date)) %>% unique(), by = "Reference_Key") %>% 
+  left_join(pc_popu %>% transmute(Reference_Key, date_nm), by ="Reference_Key") %>% 
+  filter(date > date_nm) %>% 
+  transmute(Reference_Key, date,
+            event = ifelse(is.na(mdate) | date < mdate,
+                           ifelse(event == "CR", "CRPC", "stable stage"),
+                           ifelse(event == "CR", "mCRPC", "m stable stage"))) %>% 
+  unique() %>% 
+  arrange(Reference_Key, date)
+
+## checking
+state_lab %>% filter(is.na(event))
+state_lab %>% group_by(Reference_Key, date) %>% filter(max(row_number()) > 1)
+
+records_check(state_lab)
+```
+
+## Death
+
+```{r}
+state_death <- pc_popu %>% 
+  transmute(Reference_Key, date = date_death, event = "Death") %>% 
+  filter(!is.na(date))
+
+records_check(state_death)
+```
+
+## Combine records of state
+
+Calculate time since initial diagnosis in the unit of year, round by 2.
+
+```{r}
+state_main <- rbind(state_dx, state_lab, state_death) %>% 
+  group_by(Reference_Key) %>% 
+  right_join(pc_popu %>% transmute(Reference_Key, cohort), by = "Reference_Key") %>% 
+  mutate(time = as.numeric(date - min(date))/365.25) %>% 
+  unique() %>% 
+  arrange(Reference_Key, date)
+
+# checking
+state_main %>% group_by(Reference_Key, date) %>% filter(max(row_number()) > 1) # multiple records a day
+
+state_main %>% group_by(cohort) %>% 
+  summarise(n_popu = n_distinct(Reference_Key), n_rec = max(row_number()))# summarize 
+
+# visualization
+state_main %>% 
+  mutate(Year = as.numeric(format(date, "%Y"))) %>% 
+  group_by(Year) %>% 
+  mutate(n = n_distinct(Reference_Key)) %>% 
+  group_by(Year, event) %>% 
+  summarise(Prop = n_distinct(Reference_Key)) %>% 
+  unique() %>% 
+  ggplot(aes(x = Year, y = Prop, fill = event)) +
+  geom_bar(stat = "identity")
+
+```
+
+# Part 2: Covariates preperation
+
+## Age
+
+Age = round((date - birthdate)/365.25)
+
+```{r}
+cov_age <- state_main %>% filter(time == 0) %>% 
+  left_join(dx_raw %>% transmute(Reference_Key, birthdate) %>% unique() , by = "Reference_Key") %>% 
+  transmute(Reference_Key, ini_age = round(as.numeric(date - birthdate)/365.25))
+```
+
+##  PSA
+
+Filtering lab test results of PSA in the [index date - 90, index date], and calculate the average among subjects.
+
+```{r}
+cov_psa <- state_main %>% 
+  group_by(Reference_Key) %>% 
+  transmute(Reference_Key, indexdate = min(date)) %>% 
+  unique() %>% 
+  left_join(psa_raw, by = "Reference_Key") %>% 
+  filter(lab_date <= indexdate & lab_date >= indexdate - 180) %>% 
+  group_by(Reference_Key) %>% 
+  summarise(base_res = mean(lab_res))
+
+```
+
+## CCI
+
+Calculate Charlson comorbidity index before the indexdate through the "comorbidity" package.
+
+```{r}
+library("comorbidity")
+
+load("./data/combined/Dx_total.Rda")
+all_dx_raw <- df
+
+dx_pre <- state_main %>% 
+  group_by(Reference_Key) %>% 
+  transmute(Reference_Key, indexdate = min(date)) %>% 
+  unique() %>% 
+  left_join(all_dx_raw %>% 
+              transmute(Reference_Key, 
+                        date = as.Date(Reference_Date),
+                        diag_code = `All_Diagnosis_Code_(ICD9)`) %>% 
+              unique(), by = "Reference_Key") %>% 
+  filter(date < indexdate)
+
+charlson <- comorbidity(x = dx_pre, id = "Reference_Key", code = "diag_code", map = "charlson_icd9_quan", assign0 = F) 
+charlson$cci <- score(charlson, assign0 = F)
+
+cov_com <- charlson %>% transmute(Reference_Key, cci)
+
+# cut cci into 0, 1, 2, and >= 3 level
+# cut(cci, breaks = c(0, 1, 2, 3, 100), labels = c("0", "1", "2", ">=3"),right = F)
+```
+
+## Combine
+
+Adding the 3 covariates into the total time-to-state data frame, exluding poeple without baseline PSA results.
+
+- PSA
+breaks_psa = c(-0.01, 4, 10, 20, 1000000)
+labels_psa = c("<=4", "4.1~10","10.1~20", ">20")
+cut(base_res, breaks = breaks_psa, labels = labels_psa)
+
+- Age
+breaks_age = c(0, 65, 70, 75, 80, 200)
+labels_age = c("<=65", "66~70", "71~75", "76~80", ">80")
+cut(ini_age, breaks = breaks_age, labels = labels_age)
+
+- CCI
+cut(cci, breaks = c(0,1,2,3,1000), labels = c("0", "1", "2", ">=3"), right = F)
+
+And mark the event into two version of states:
+
+- seven-states model
+levels_7 = c("HNPC", "mHSPC", "CRPC", "mCRPC", "stable stage", "m stable stage", "Death")
+labels_7 = 1:7
+
+- four-states model
+levels_7 = c("HNPC", "mHSPC", "CRPC", "mCRPC", "stable stage", "m stable stage", "Death")
+labels_4 = c(1, 3, 2, 3, 2, 3, 4)
+
+```{r}
+breaks_psa = c(-0.01, 4, 10, 1000000)
+labels_psa = c("<=4", "4.1~10", ">10")
+
+breaks_age = c(0, 65, 70, 75, 80, 200)
+labels_age = c("<=65", "66~70", "71~75", "76~80", ">80")
+
+levels_7 = c("HNPC", "mHSPC", "CRPC", "mCRPC", "stable stage", "m stable stage", "Death")
+labels_7 = 1:7
+#levels_4 = c("HNPC", "Localized PC", "Metastasis PC", "Death")
+labels_4 = c(1, 3, 2, 3, 2, 3, 4)
+
+state_main_cov <- state_main %>% left_join(cov_age, by = "Reference_Key") %>% 
+  left_join(cov_psa, by = "Reference_Key") %>% 
+  left_join(cov_com, by = "Reference_Key") %>% 
+  mutate(cci = fill0(cci)) %>% 
+  filter(!is.na(base_res)) %>% 
+  transmute(Reference_Key, date, event, cohort,time,
+            base_res, base_res_grp = cut(base_res, breaks = breaks_psa, labels = labels_psa),
+            ini_age, ini_age_grp = cut(ini_age, breaks = breaks_age, labels = labels_age),
+            cci,
+            cci_grp = cut(cci, breaks = c(0, 1, 2, 3, 1000), labels = c("0", "1", "2", ">=3"), right = F),
+            state_7 = factor(event, levels = levels_7, labels = labels_7),
+            state_4 = factor(event, levels = levels_7, labels = labels_4))
+
+## 
+
+```
+
+
+```{r}
+## check
+state_main_cov %>% group_by(cohort) %>% 
+  summarise(n_popu = n_distinct(Reference_Key),
+            n_rec = max(row_number()))
+
+### age
+state_main_cov %>% transmute(Reference_Key, ini_age) %>% unique() %>% 
+  ggplot(aes(ini_age))+geom_bar()
+
+### psa
+state_main_cov %>% transmute(Reference_Key, base_res) %>% unique() %>% 
+  ggplot(aes(base_res))+geom_histogram()
+
+### cci
+state_main_cov %>% transmute(Reference_Key, cci) %>% unique() %>% 
+  ggplot(aes(cci))+geom_histogram()
+
+state_main_cov %>% transmute(Reference_Key, cohort, cci) %>% 
+  left_join(charlson, by = "Reference_Key") %>% 
+  pivot_longer(mi:aids, names_to = "cate", values_to = "res") %>% 
+  filter(res > 0) %>% 
+  group_by(cohort,cate) %>% summarise(n_distinct(Reference_Key))
+
+state_main_cov %>% transmute(Reference_Key, cohort, cci) %>% 
+  left_join(charlson, by = "Reference_Key") %>% 
+  pivot_longer(mi:aids, names_to = "cate", values_to = "res") %>% 
+  ggplot(aes(x = cate, y = res, fill = cohort)) + 
+  geom_histogram(position = "stack", stat = "identity")
+```
+
+
+
+# Study population, filtering and table 1
+
+```{r}
+state_main_2 <- state_main_cov %>% filter(cohort >= 2010 & cohort <= 2012) %>% 
+  filter(time <= 10) %>% 
+  unique() %>% 
+  group_by(Reference_Key) %>% 
+  filter(n_distinct(event) > 1) %>% 
+  ungroup()
+  
+
+state_main_open <- state_main_cov %>% filter(cohort == 2013) %>% 
+  filter(time <= 10) %>% 
+  unique() %>% 
+  group_by(Reference_Key) %>% 
+  filter(n_distinct(event) > 1) %>% 
+  ungroup()
+
+saveRDS(state_main_open,"./Middle_results/state_main_open_new.RData")
+saveRDS(state_main_2,"./Middle_results/state_main_2_new.RData")
+
+## check
+n_distinct(state_main_2$Reference_Key)
+
+state_main_cov %>% filter(cohort >= 2010 & cohort <= 2012) %>% 
+  filter(time <= 10) %>% 
+  unique() %>% 
+  group_by(Reference_Key) %>% 
+  filter(n_distinct(event) == 1) %>% ungroup() %>% 
+  summarise(n_distinct(Reference_Key))
+```
+
+```{r}
+# filtering
+
+rk <- 1003289
+## diag of PC
+dx_raw %>% 
+  group_by(Reference_Key) %>% 
+  filter(date == min(date)) %>% 
+  filter(date <= "2013-12-31" & date >= "2010-01-01") %>% 
+  mutate(group = ifelse(date<="2012-12-31", "Training", "Testing")) %>%
+  group_by(group) %>% 
+  summarise(n = n_distinct(Reference_Key))
+
+## meta <nm and death < meta
+pc_popu %>% 
+  filter(date_nm <= "2013-12-31" & date_nm >= "2010-01-01") %>% 
+  mutate(group = ifelse(date_nm <="2012-12-31", "Training", "Testing")) %>% 
+  group_by(group) %>% 
+  summarise(n = n_distinct(Reference_Key))
+
+## state_main
+state_main %>% 
+  filter(time == 0) %>% 
+  filter(date <= "2013-12-31" & date >= "2010-01-01") %>% 
+  mutate(group = ifelse(date <="2012-12-31", "Training", "Testing")) %>% 
+  group_by(group) %>% 
+  summarise(n = n_distinct(Reference_Key))
+
+## state main cov
+state_main_cov %>% 
+  filter(time == 0) %>% 
+  filter(date <= "2013-12-31" & date >= "2010-01-01") %>% 
+  mutate(group = ifelse(date <="2012-12-31", "Training", "Testing")) %>% 
+  group_by(group) %>% 
+  summarise(n = n_distinct(Reference_Key))
+
+## state_main_2/open
+state_main_2 %>% summarise(n = n_distinct(Reference_Key))
+
+state_main_open %>% summarise(n = n_distinct(Reference_Key))
+```
+
+
+
+```{r}
+gen0 <- function(var){return(factor(ifelse(is.na(var),0,var),
+                                    levels = c(0,1),
+                                    labels = c("Not have", "have")))}
+
+state_main_lst <- lapply(seq_along(list(state_main_2, state_main_open)), function(i){
+
+  state_main_ori <- list(state_main_2, state_main_open)[[i]]
+  ## add info to data frame
+  state_main_ori %>% filter(time == 0) %>% 
+    left_join(state_main_ori %>% filter(event == "Death") %>% 
+                transmute(Reference_Key, death_fl = 1, death_date = date) %>% unique(), by = "Reference_Key") %>% 
+    left_join(state_main_ori %>% filter(event %in% c("mHSPC", "mCRPC", "m stable stage")) %>% 
+                group_by(Reference_Key) %>% filter(date == min(date)) %>% 
+                transmute(Reference_Key, meta_fl = 1, meta_date = date) %>% unique(), by = "Reference_Key") %>% 
+    #left_join(charlson_long, by = "Reference_Key") %>% 
+    transmute(Reference_Key, 
+              cohort = c("T0", "T1")[i],
+              base_res, ini_age, cci,
+              base_res_grp, ini_age_grp, cci_grp,
+              meta = gen0(meta_fl), 
+              pyear_meta = as.numeric(meta_date - date)/365.25,
+              death = gen0(death_fl), 
+              pyear_death = as.numeric(death_date - date)/365.25)
+})
+
+visual_person_time <- function(){
+  # distribution of person time
+  par(mfrow = c(2,2))
+  hist(state_main_lst[[1]]$pyear_meta)
+  hist(state_main_lst[[1]]$pyear_death)
+  
+  hist(state_main_lst[[2]]$pyear_meta)
+  hist(state_main_lst[[2]]$pyear_death)
+}
+
+## adding var label
+#### adding p - value
+pvalue <- function(x, ...) {
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  if (is.numeric(y)) {
+    p <- t.test(y ~ g)$p.value #数值型数据用t-test(两组比较)
+  } else {
+    p <- chisq.test(table(y, g))$p.value #因子型数据用卡方
+  }
+  c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+baseinfo <- labelled::set_variable_labels(do.call(rbind,state_main_lst) %>% 
+                                            unique(),
+                                          .labels =c("Reference_Key",
+                                                     "Cohort",
+                                                     "Baseline PSA level",  
+                                                     "Age at first diagnosis", 
+                                                     "Chalson comorbidity index", 
+                                                     "Categorical baseline PSA level",  
+                                                     "Categorical age at first diagnosis", 
+                                                     "Categorical Chalson comorbidity index", 
+                                                     "Metastasis event","Time to metastasis",
+                                                     "Death event", "Time to death"))
+
+### categorical variable TB1
+library(table1)
+(tb1 <- table1( ~  ini_age + ini_age_grp  + cci + cci_grp + base_res + base_res_grp +
+          meta + pyear_meta + death + pyear_death|cohort,
+        data=baseinfo, overall = F,  extra.col = list('P-value' = pvalue)))
+
+write.csv(tb1, "tb1.csv")
+
+## IQR
+table1( ~ base_res |cohort,
+        data=baseinfo, overall = F,  extra.col = list('P-value' = pvalue),
+       render.continuous=c(.="Median [IQR, Q1, Q2, Q3]"))
+
+## Med his
+levels <- colnames(charlson)[2:18]
+labels <- c("Myocardial infarction","Congestive heart failure","Peripheral vascular disease",
+            "Cerebrovascular disease","Dementia","Chronic pulmonary disease",
+            "Rheumatoid disease","Peptic ulcer disease","Mild liver diseas",
+            "Diabetes without complications","Diabetes with complications",
+            "Hemiplegia or paraplegia","Renal disease","Malignant cancer",
+            "Moderate or severe liver disease","Metastatic solid tumour","Acquired Immune Deficiency Syndrome")
+
+
+state_main_cci <- charlson %>% 
+  pivot_longer(mi:aids, values_to = "res", names_to = "MedicalHistory") %>% 
+  filter(res > 0) %>% 
+  transmute(Reference_Key,
+            MedicalHistory = factor(MedicalHistory, levels = colnames(charlson)[2:18], labels = labels),
+            res) %>% 
+  right_join(union(state_main_2 %>% transmute(Reference_Key, cohort = "T0"),
+                  state_main_open %>% transmute(Reference_Key, cohort = "T1")) %>% unique(), by = "Reference_Key") %>% 
+  filter(!is.na(res))
+
+### Medical History
+baseinfo1 <- labelled::set_variable_labels(state_main_cci, 
+                                           .labels =c("Reference Key","Medical history", "Results", "Cohort"))
+
+### categorical variable TB1
+(tb1_med <- table1( ~  MedicalHistory | cohort,
+        data=baseinfo1, overall = F,  extra.col = list('P-value' = pvalue)))
+write.csv(tb1_med, "tb1_med.csv")
+```
+
+
+# Fitting
+
+## Preperation
+
+Q_7states <- rbind(c(0, 1, 1, 0, 1, 1, 1),
+                   c(0, 0, 0, 1, 0, 1, 1),
+                   c(0, 0, 0, 1, 1, 0, 1),
+                   c(0, 0, 0, 0, 0, 1, 1),
+                   c(0, 0, 1, 1, 0, 1, 1),
+                   c(0, 0, 0, 1, 0, 0, 1),
+                   c(0, 0, 0, 0, 0, 0, 0))
+
+```{r}
+### time-to-trans
+Q_7states <- rbind(c(0, 1, 1, 0, 1, 0, 1),
+                   c(0, 0, 0, 1, 0, 1, 1),
+                   c(0, 0, 0, 1, 1, 0, 1),
+                   c(0, 0, 0, 0, 0, 0, 1),
+                   c(0, 0, 1, 1, 0, 1, 1),
+                   c(0, 0, 0, 1, 0, 0, 1),
+                   c(0, 0, 0, 0, 0, 0, 0))
+
+Q_4states <- rbind(c(0,1,1,1),
+                   c(0,0,1,1),
+                   c(0,0,0,1),
+                   c(0,0,0,0))
+
+time2trans <- function(state_main_ori, q_mat, state_var){
+  state_main_temp <- state_main_ori %>% group_by(Reference_Key, event) %>% 
+    filter(time == min(time) | time == max(time)) %>% ungroup()
+  
+  state_main_temp$state <- as.numeric(as.character(state_main_temp[[state_var]])) 
+  temp <- msm2Surv(data = state_main_temp, subject = "Reference_Key", time = "time", state = "state", Q = q_mat)
+  temp$trans <- as.factor(temp$trans)
+  temp
+}
+
+state_main_surv_lst_7states <- time2trans(state_main_2, q_mat = Q_7states, state_var = "state_7")
+tmat_7states <- attr(state_main_surv_lst_7states, "trans")  
+
+state_main_surv_lst_4states <- time2trans(state_main_2, q_mat = Q_4states, state_var = "state_4")
+tmat_4states <- attr(state_main_surv_lst_4states, "trans")  
+
+### summarising number of patinents in each transition
+state_main_surv_lst_7states %>% filter(status == 1) %>% group_by(trans) %>% summarise(N = n_distinct(id))
+state_main_surv_lst_4states %>% filter(status == 1) %>% group_by(trans) %>% summarise(N = n_distinct(id))
+```
+
+## 7 states model
+
+```{r}
+
+t_state_fitting_7 <- function(){
+  nonhomo.fit.cov <- flexsurvreg(Surv(Tstart, Tstop, status) ~ trans + shape(trans) + 
+                                   ini_age_grp + shape(ini_age_grp) +
+                                   cci_grp + shape(cci_grp) + 
+                                   base_res_grp + shape(base_res_grp), 
+                                 data = state_main_surv_lst_7states,
+                                 dist = "Weibull") 
+  
+  fit_lst_7states_cov <- list(nonhomo.fit.cov)
+  saveRDS(fit_lst_7states_cov, "./Middle_results/fit_7states_cov_dis_new.RData")
+}
+t_state_fitting_7()
+fit_lst_7states_cov <- readRDS("./Middle_results/fit_7states_cov_dis_new.RData")
+lapply(fit_lst_7states_cov, AIC)
+
+```
+
+## 4 states model
+
+```{r}
+
+t_state_fitting_4 <- function(){
+  nonhomo.fit.cov <- flexsurvreg(Surv(Tstart, Tstop, status) ~ trans + shape(trans) + 
+                                   ini_age_grp + shape(ini_age_grp) +
+                                   cci_grp + shape(cci_grp) + 
+                                   base_res_grp + shape(base_res_grp), 
+                                 data = state_main_surv_lst_4states,
+                                 dist = "Weibull")
+  
+  fit_lst_4states_cov <- list(nonhomo.fit.cov)
+  saveRDS(fit_lst_4states_cov, "./Middle_results/fit_4states_cov_dis_new.RData")
+}
+
+t_state_fitting_4()
+fit_lst_4states_cov <- readRDS("./Middle_results/fit_4states_cov_dis_new.RData")
+lapply(fit_lst_4states_cov, AIC)
+```
+
+
+
+# Evaluation
+
+## Prepare prediction
+
+```{r}
+## metastasis free survival & overall survival
+mfs_levels_4st <- 1:4
+mfs_labels_4st <- c("0","0","1","1")
+
+os_levels_4st <- 1:4
+os_labels_4st <- c("0","0","0","1")
+
+mfs_levels_7st <- 1:7
+mfs_labels_7st <- c("0","1","0","1","0","1","1")
+
+os_levels_7st <- 1:7
+os_labels_7st <- c("0","0","0","0","0","0","1")
+
+gen_tte <- function(state_main_ori){
+  ## generate time to event dataset
+  state_main_ori %>% 
+    transmute(Reference_Key, time = round(time,2), state_4, 
+              ini_age_grp, cci_grp, base_res_grp) %>% 
+    mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+           os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+}
+
+## Observed event for MFS and OS
+### training set
+tte_train <- gen_tte(state_main_2) 
+
+### testing set
+tte_test <- gen_tte(state_main_open) 
+
+saveRDS(tte_test, "tte_test.RData")
+saveRDS(tte_train, "tte_train.RData")
+## prediction 
+
+### cal subgroup weight
+subgroup_weight <- function(){
+  ## level of each group
+  lcl_ind <- lapply(c("ini_age_grp", "cci_grp", "base_res_grp"), function(xi){
+    unique(state_main_2[,xi])
+  })
+  
+  ## counting weight fro each level of covariates combination
+  library(tibble)
+  weight_null <- data.frame(expand.grid(deframe(lcl_ind[[1]]), 
+                                        deframe(lcl_ind[[2]]), 
+                                        deframe(lcl_ind[[3]])))
+  names(weight_null) <- c("ini_age_grp", "cci_grp", "base_res_grp")
+  
+  N <- n_distinct(state_main_2$Reference_Key)
+  weight <- state_main_2 %>% filter(time == 0) %>% 
+    group_by(ini_age_grp, cci_grp, base_res_grp) %>% 
+    summarise(weight = n_distinct(Reference_Key)/N) %>% 
+    mutate(obs_fl = T) %>% 
+    right_join(weight_null, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+    mutate(weight = ifelse(is.na(weight), 0, weight))
+  
+  obs_combine <- weight %>% filter(obs_fl == T) %>% select(ini_age_grp, cci_grp, base_res_grp)
+  return(obs_combine)
+}
+
+### predict trans prob
+seperate_tras_prob <- function(mod, #fitted model
+                               comb = obs_combine, #covariates
+                               time_points = tgrid, #prediction time points
+                               num_state = 7, # suggesting model type, 7 or 4
+                               subgroup = F){
+  ## specify parameter relate to model type
+  death_state <- num_state
+  
+  if(num_state == 7){
+    tmat = tmat_7states
+    mfs_level = mfs_levels_7st
+    mfs_label = mfs_labels_7st
+    
+    os_level = os_levels_7st
+    os_label = os_labels_7st
+  }else{
+    tmat = tmat_4states
+    mfs_level = mfs_levels_4st
+    mfs_label = mfs_labels_4st
+    
+    os_level = os_levels_4st
+    os_label = os_labels_4st
+  }
+  
+  
+  ## predicted transition probability from the fitted model 
+  pred.state <- do.call(rbind,apply(comb, 1, function(comb_i){
+    
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3]))
+    
+    state_rate <- do.call(rbind, lapply(paste0("pstate", 1:death_state), function(end_state_i){
+      do.call(rbind,lapply(1:(death_state - 1), function(start_state_i){
+        data.frame(ini_state = start_state_i, end_state = as.numeric(substr(end_state_i,7,7)),
+                   ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3], time = time_points,
+                   state_rate = probtrans(mf, predt = 0, direction = "forward", variance = F)[[start_state_i]][,end_state_i])
+      }))
+    })
+    )
+  }))
+  
+  pred.state.temp <- pred.state %>% 
+    ungroup() %>% 
+    filter(ini_state == 1) %>% 
+    mutate(mfs_state = factor(end_state, 
+                              levels = mfs_level,
+                              labels = mfs_label),
+           os_state = factor(end_state,
+                             levels = os_level,
+                             labels = os_label))
+  
+  pred.state.mfs <- pred.state.temp %>% 
+    group_by(ini_age_grp, cci_grp, base_res_grp, time, mfs_state) %>% 
+    mutate(mfs_prob = sum(state_rate)) %>% ungroup() %>% 
+    filter(mfs_state == 1) %>% 
+    transmute(time,
+              ini_age_grp, cci_grp, base_res_grp,
+              mfs_prob) %>% 
+    unique()
+  
+  pred.state.os <- pred.state.temp %>% 
+    group_by(ini_age_grp, cci_grp, base_res_grp, time, os_state) %>% 
+    mutate(os_prob = sum(state_rate)) %>% ungroup() %>% 
+    filter(os_state == 1) %>% 
+    transmute(time,
+              ini_age_grp, cci_grp, base_res_grp,
+              os_prob) %>% 
+    unique()
+  
+  pred.state.mfs %>% left_join(pred.state.os, by = c("time","ini_age_grp", 
+                                                     "cci_grp", "base_res_grp")) 
+}
+
+### combine obs and pred
+eva_mfs_os <-function(df_ori,df_pred){
+  
+  ori_pred <- df_ori %>% 
+    mutate(time_c = as.character(time)) %>% select(-time) %>% 
+    left_join(df_pred %>% mutate(time_c = as.character(time)), 
+              by = c("time_c","ini_age_grp", 
+                     "cci_grp", "base_res_grp")) %>% 
+    unique() 
+  
+  mfs_pred <- ori_pred %>%
+    filter(!is.na(mfs_prob)) %>%
+    group_by(Reference_Key,mfs_event) %>% 
+    filter(time == max(time)) %>% 
+    group_by(Reference_Key) %>% 
+    filter(row_number() == max(row_number()))
+  
+  os_pred <-ori_pred %>%
+    filter(!is.na(os_prob)) %>%
+    group_by(Reference_Key,os_event) %>% 
+    filter(time == max(time)) %>% 
+    group_by(Reference_Key) %>% 
+    filter(row_number() == max(row_number()))
+  
+  return(list(mfs_pred,os_pred))
+}
+
+
+obs_combine <- subgroup_weight() # combination of 3 covariates
+
+## cal trans
+dt = 0.01
+tgrid <- seq(0,11, by = dt)
+
+cal_trans <- function(){
+  ### 4 state prediction
+  
+  fit_lst_4states_cov <- readRDS("./Middle_results/fit_4states_cov_dis_new.RData") # read fit result
+  
+  pred_4state_spe <- seperate_tras_prob(mod = fit_lst_4states_cov[[1]], 
+                                        comb = obs_combine,
+                                        num_state = 4,
+                                        subgroup = T) # predict transprobability according to fit and covariates
+  
+  saveRDS(pred_4state_spe,"./Middle_results/pred_4state_spe_new.RData")
+  
+  
+  ### 7 - states prediction
+  
+  fit_lst_7states_cov <- readRDS("./Middle_results/fit_7states_cov_dis_new.RData") 
+  
+  pred_7state_spe <- seperate_tras_prob(mod = fit_lst_7states_cov[[1]], 
+                                        comb = obs_combine,
+                                        num_state = 7,
+                                        subgroup = T)
+  
+  saveRDS(pred_7state_spe, "./Middle_results/pred_7state_spe_new.RData")
+}
+
+cal_trans()
+
+pred_4state_spe <- readRDS("./Middle_results/pred_4state_spe_new.RData")
+pred_7state_spe <- readRDS("./Middle_results/pred_7state_spe_new.RData")
+```
+
+
+## AOU
+
+```{r}
+aou <- readRDS("D:/OneDriveHKU_Jakiwang/OneDrive - The University Of Hong Kong/Desktop/PC_writting/PC_AOU/rstudio-export_PC/survauc_B_lst_.RData")
+aou <- readRDS("survival_AUC_bootstrap.RData")
+temp <- do.call(rbind, aou) %>% 
+  group_by(time, model) %>% 
+  summarise(q1=quantile(mfs,0.025),
+            q3=quantile(mfs,0.975),
+            se = sd(mfs))
+temp
+```
+
+
+## time-dependent AUC
+
+```{r}
+## evaluation - individual level
+library(survivalROC)
+
+train_4state <- eva_mfs_os(df_ori = tte_train, df_pred = pred_4state_spe)[[1]]
+pred_4state <- eva_mfs_os(df_ori = tte_test, df_pred = pred_4state_spe)[[1]]
+
+train_7state <- eva_mfs_os(df_ori = tte_train, df_pred = pred_7state_spe)[[1]]
+pred_7state <- eva_mfs_os(df_ori = tte_test, df_pred = pred_7state_spe)[[1]]
+
+
+###
+survauc_df <-do.call(rbind,lapply(1:2, function(i){
+  do.call(rbind,lapply(1:2, function(j){
+    temp <-list(pred_4state, pred_7state)[[j]]
+ 
+    res_mfs <-  survivalROC(Stime=temp$time,
+          status=temp$mfs_event,
+          marker = 1 - temp$mfs_prob,
+          predict.time = 5*i, 
+          span = 0.25*nrow(temp)^(-0.20) )
+      
+    res_os <- survivalROC(Stime=temp$time,
+          status=temp$os_event,
+          marker = 1 - temp$os_prob,
+          predict.time = 5*i, 
+          span = 0.25*nrow(temp)^(-0.20) )
+    
+    return(data.frame(mfs = res_mfs$AUC, os = res_os$AUC, time = 5*i, model = c("4state", "7state")[j]))
+  }))
+}))
+
+survauc_lst <-lapply(1:2, function(j){
+  lapply(1:2, function(i){
+    temp <-list(pred_4state, pred_7state)[[j]]
+    
+    res_mfs <-  survivalROC(Stime=temp$time,
+                            status=temp$mfs_event,
+                            marker = 1 - temp$mfs_prob,
+                            predict.time = 5*i, 
+                            span = 0.25*nrow(temp)^(-0.20) )
+    
+    res_os <- survivalROC(Stime=temp$time,
+                          status=temp$os_event,
+                          marker = 1 - temp$os_prob,
+                          predict.time = 5*i, 
+                          span = 0.25*nrow(temp)^(-0.20) )
+    
+    out <- list(mfs = res_mfs, os = res_os)
+    names(out) <- paste0("time",5*i, "model", c("4state", "7state")[j])
+    return(out)
+  })
+})
+
+## numerical result
+do.call(rbind, lapply(survauc_lst, function(surv_lst_i){
+  do.call(cbind,lapply(surv_lst_i, function(surv_i){
+    union(data.frame(AUC = surv_i[[1]]$AUC, type = "MFS"),
+               data.frame(AUC = surv_i[[2]]$AUC, type = "OS"))
+  }))
+}))
+
+## visualization
+FPTP <- do.call(rbind, lapply(1:2, function(k){
+  surv_lst_i <- survauc_lst[[k]] # 4 state and 7 state model
+  do.call(rbind, lapply(1:2, function(j){
+    surv_i <- surv_lst_i[[j]] # time = 5 and 10
+    do.call(rbind, lapply(1:2, function(i){ # MFS and OS
+      data.frame(FP = surv_i[[i]]$FP,
+                 TP = surv_i[[i]]$TP,
+                 type = c("MFS", "OS")[i],
+                 time = c(5,10)[j],
+                 model = c("4 state", "7 state")[k])
+    }))
+  }))
+}))
+
+library(RColorBrewer)
+t_strata <- unique(FPTP$time)
+my_green = brewer.pal(n = length(t_strata), "Greens")[seq(1,length(t_strata)*2,2)] 
+
+ggplot(FPTP,aes(x = FP, y = TP, fill = as.factor(time)))+
+  facet_grid(cols = vars(type),rows = vars(model))+
+  geom_line()+
+  geom_area(position = "jitter",alpha=0.3,size=1) +
+  xlab("1 - Specificity") + ylab("Sencitivity") +
+  scale_fill_manual(values = my_green,
+                    name = "Time post \n diagnosis \n (year)",
+                    breaks = t_strata,
+                    labels = t_strata)+
+  theme(panel.spacing.x = unit(4, "mm"), text = element_text(size = 15),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", colour = "black"),
+        strip.background = element_rect(colour = "black", fill = "white"),
+        strip.text = element_text(face="bold", size=16,lineheight=5.0),
+        legend.key = element_rect(fill = "white", colour = "white"),
+        legend.title = element_text(size=16),
+        legend.text = element_text(size=16))
+
+
+## bootstrap
+
+do.call(rbind, lapply(survauc_lst, function(surv_lst_i){
+  do.call(cbind,lapply(surv_lst_i, function(surv_i){
+    union(data.frame(AUC = surv_i[[1]]$AUC, type = "MFS"),
+               data.frame(AUC = surv_i[[2]]$AUC, type = "OS"))
+  }))
+}))
+
+boot <- readRDS("survival_AUC_bootstrap.RData")
+
+boot$out
+boot_quan
+
+boot_quan <- do.call(rbind,boot$raw) %>% 
+  pivot_longer(mfs:os, names_to = "type", values_to = "auc") %>% 
+  group_by(time, model, type) %>% 
+  transmute(auc_q1 = quantile(auc, 0.025),
+         auc_q3 = quantile(auc, 0.975),
+         auc_sd = sd(auc)) %>% 
+  unique() 
+
+write.csv(boot$out, "./Middle_results/bootstrap_quantile.csv")
+```
+
+## Ordinary AUC/c-index
+
+```{r}
+eva_mfs_os_spetime <-function(df_ori,df_pred,tpoints = 5){
+  
+  temp_df <- df_ori %>% 
+    filter(time <= tpoints) 
+  
+  ## mfs
+  
+  temp_df_mfs <- union(  temp_df %>% group_by(Reference_Key) %>% 
+                           filter(max(as.numeric(as.character(mfs_event))) == 0) %>% 
+                           filter(time == max(time)) %>% 
+                           mutate(time = tpoints), 
+                         temp_df %>% group_by(Reference_Key) %>% 
+                           filter(max(as.numeric(as.character(mfs_event))) > 0) %>% 
+                           filter(mfs_event == 1) %>% 
+                           filter(time == min(time))) %>% 
+    mutate(time_c = as.character(tpoints)) %>% select(-time) %>% # obs at time = tpoints
+    left_join(df_pred %>% mutate(time_c = as.character(time)), 
+              by = c("time_c","ini_age_grp", 
+                     "cci_grp", "base_res_grp")) %>% 
+    unique() %>% 
+    transmute(Reference_Key, mfs_time = time, mfs_event, mfs_prob)
+  
+  ## os
+  temp_df_os <- union(temp_df %>% group_by(Reference_Key) %>% 
+                        filter(max(as.numeric(as.character(os_event))) == 0) %>% 
+                        filter(time == max(time)) %>% 
+                        mutate(time = tpoints), 
+                      temp_df %>% group_by(Reference_Key) %>% 
+                        filter(max(as.numeric(as.character(os_event))) > 0) %>% 
+                        filter(os_event == 1) %>% 
+                        filter(time == min(time))) %>% 
+    mutate(time_c = as.character(tpoints)) %>% select(-time) %>% #  obs at time = tpoints
+    left_join(df_pred %>% mutate(time_c = as.character(time)), 
+              by = c("time_c","ini_age_grp", 
+                     "cci_grp", "base_res_grp")) %>% 
+    unique() %>% 
+    transmute(Reference_Key, os_time = time, os_event, os_prob)
+  
+  ori_pred <- temp_df_mfs %>% left_join(temp_df_os, by = "Reference_Key")
+  
+  return(ori_pred)
+}
+
+pred_lst <- lapply(list(5,10), function(t){
+  train_4state <- eva_mfs_os_spetime(df_ori = tte_train, df_pred = pred_4state_spe, tpoints = t)
+  test_4state <- eva_mfs_os_spetime(df_ori = tte_test, df_pred = pred_4state_spe, tpoints = t)
+  
+  
+  train_7state <- eva_mfs_os_spetime(df_ori = tte_train, df_pred = pred_7state_spe, tpoints = t)
+  test_7state <- eva_mfs_os_spetime(df_ori = tte_test, df_pred = pred_7state_spe, tpoints = t)
+  
+  temp_lst <- list(test_4state,test_7state)
+  names(temp_lst) <- c("test_4state","test_7state")
+  
+  return(temp_lst)
+})
+
+library(pROC)
+auc_df <-do.call(rbind,lapply(2, function(i){
+  do.call(rbind,lapply(1:2, function(j){
+    temp <-pred_lst[[i]][[j]]
+ 
+    res_mfs <-roc(temp$mfs_event, temp$mfs_prob)
+    res_os <-roc(temp$os_event, temp$os_prob)
+    
+    return(data.frame(mfs = res_mfs$auc, 
+                      os = res_os$auc, 
+                      time = 5*i, model = c("4state", "7state")[j]))
+  }))
+}))
+
+auc_df
+
+c_indx <- function(obj){
+    temp_c <- obj[["C Index"]]
+    temp_lb <- temp_c - 1.96*obj[["S.D."]]
+    temp_ub <- temp_c + 1.96*obj[["S.D."]]
+    return(data.frame(cindex = round(temp_c,4), ci = paste0("(",round(temp_lb,4),",",round(temp_ub,4),")")))
+}
+
+
+do.call(rbind,lapply(2, function(i){
+  do.call(rbind,lapply(1:2, function(j){
+    temp <-pred_lst[[i]][[j]]
+ 
+    res_mfs <- c_indx(Hmisc::rcorr.cens(temp$mfs_prob, temp$mfs_event))
+    res_os <- c_indx(Hmisc::rcorr.cens(temp$os_prob, temp$os_event))
+    
+    return(data.frame(mfs = res_mfs$cindex, mfs_ci = res_mfs$ci,
+                      os = res_os$cindex, os_ci = res_os$ci,
+                      time = 5*i, model = c("4state", "7state")[j]))
+  }))
+}))
+
+```
+
+## Cox RSF comparison
+
+### COX
+
+```{r}
+coxph_lst <- lapply(c(10), function(tpoints){ # for year 10
+  print(tpoints)
+  train_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>%   
+      transmute(Reference_Key, time = time, status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    temp_df_os <- temp_df %>% 
+      transmute(Reference_Key, time, status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  test_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      filter(time <= t) %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>%  
+      transmute(Reference_Key, time , status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    temp_df_os <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>% 
+      transmute(Reference_Key, time, status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  
+  train_mfs <- as.data.frame(train_mfs_os(state_main_2)[[1]])
+  test_mfs <- as.data.frame(test_mfs_os(state_main_open)[[1]])
+  train_os <- as.data.frame(train_mfs_os(state_main_2)[[2]])
+  test_os <- as.data.frame(test_mfs_os(state_main_open)[[2]])
+  
+  fit_cidx <- function(df_train,df_test){
+    fit <- coxph(Surv(time, status) ~ ini_age_grp + cci_grp + base_res_grp, df_train)
+    
+    pred.table <- do.call(rbind,lapply(1:nrow(obs_combine), function(i){
+      comb_i <- obs_combine[i,]
+      pred <- survfit(fit, 
+                      newdata=data.frame(ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3]))
+      
+      data.frame(time = pred$time, pred = pred$surv, pred$newdata)
+    }))
+    
+    df_pred <- pred.table %>% 
+      #mutate(time_c = as.character(round(time,2))) %>% select(-time) %>% 
+      right_join(df_test , 
+                 by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      group_by(Reference_Key) %>% 
+      filter(abs(time.x - time.y) == min(abs(time.x - time.y))) %>% 
+      unique() %>% arrange(Reference_Key) %>% 
+      group_by(Reference_Key) %>% 
+      transmute(Reference_Key, time = time.x, status, pred = mean(pred)) %>% unique()
+    
+    return(df_pred)
+  }
+  
+  mfs_roc <- fit_cidx(df_train = train_mfs, df_test = test_mfs)
+  os_roc <- fit_cidx(df_train = train_os, df_test = test_os)
+
+  return(list(mfs = mfs_roc, os = os_roc))
+})
+
+coxph_lst <- lapply(c(10), function(tpoints){ # for year 10
+  print(tpoints)
+
+  train_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- union(temp_df %>% group_by(Reference_Key) %>% 
+      filter(max(as.numeric(as.character(mfs_event))) == 0) %>% 
+      filter(time == max(time)) %>% 
+        transmute(Reference_Key, time = 10, status = as.numeric(mfs_event)-1,
+                  ini_age_grp, cci_grp, base_res_grp) %>% unique(),
+      temp_df %>% group_by(Reference_Key) %>% 
+        filter(max(as.numeric(as.character(mfs_event))) > 0) %>% 
+        filter(mfs_event == 1) %>% 
+        filter(time == min(time)) %>% 
+        transmute(Reference_Key, time = time, status = as.numeric(mfs_event)-1,
+                  ini_age_grp, cci_grp, base_res_grp)%>% unique()) 
+    
+    temp_df_os <- union(temp_df %>% group_by(Reference_Key) %>% 
+                           filter(max(as.numeric(as.character(os_event))) == 0) %>% 
+                           filter(time == max(time)) %>% 
+                           transmute(Reference_Key, time = 10, status = as.numeric(os_event)-1,
+                                     ini_age_grp, cci_grp, base_res_grp) %>% unique(),
+                         temp_df %>% group_by(Reference_Key) %>% 
+                           filter(max(as.numeric(as.character(os_event))) > 0) %>% 
+                           filter(os_event == 1) %>% 
+                           filter(time == min(time)) %>% 
+                           transmute(Reference_Key, time = time, status = as.numeric(os_event)-1,
+                                     ini_age_grp, cci_grp, base_res_grp)%>% unique()) 
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  
+  test_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      filter(time <= t) %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>%  
+      transmute(Reference_Key, time, status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    temp_df_os <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>% 
+      transmute(Reference_Key, time, status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  
+  train_mfs <- as.data.frame(train_mfs_os(state_main_2)[[1]])
+  test_mfs <- as.data.frame(test_mfs_os(state_main_open)[[1]])
+  train_os <- as.data.frame(train_mfs_os(state_main_2)[[2]])
+  test_os <- as.data.frame(test_mfs_os(state_main_open)[[2]])
+  
+  fit_cidx <- function(df_train,df_test){
+    fit <- coxph(Surv(time, status) ~ ini_age_grp + cci_grp + base_res_grp, df_train)
+    
+    pred.table <- do.call(rbind,lapply(1:nrow(obs_combine), function(i){
+      comb_i <- obs_combine[i,]
+      pred <- survfit(fit, 
+                      newdata=data.frame(ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3]))
+      
+      data.frame(time = pred$time, pred = pred$surv, pred$newdata)
+    }))
+    
+    df_pred <- pred.table %>% 
+      #mutate(time_c = as.character(round(time,2))) %>% select(-time) %>% 
+      right_join(df_test , 
+                 by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      group_by(Reference_Key) %>% 
+      filter(abs(time.x - time.y) == min(abs(time.x - time.y))) %>% 
+      unique() %>% arrange(Reference_Key) %>% 
+      group_by(Reference_Key) %>% 
+      transmute(Reference_Key, time = time.x, status, pred = mean(pred)) %>% unique()
+    
+    return(df_pred)
+  }
+  
+  mfs_roc <- fit_cidx(df_train = train_mfs, df_test = test_mfs)
+  os_roc <- fit_cidx(df_train = train_os, df_test = test_os)
+  
+  return(list(mfs = mfs_roc, os = os_roc))
+})
+
+c_indx(Hmisc::rcorr.cens(coxph_lst[[1]]$mfs$pred, coxph_lst[[1]]$mfs$status))
+c_indx(Hmisc::rcorr.cens(coxph_lst[[1]]$os$pred, coxph_lst[[1]]$os$status))
+
+confuse_matrix <- function(pred, obs){
+  library(caret)
+  temp <- confusionMatrix(as.factor(ifelse(pred >= 0.5, 1, 0)), as.factor(obs))
+  
+  temp$byClass
+}
+
+confuse_matrix(pred = coxph_lst[[1]]$mfs$pred, obs = coxph_lst[[1]]$mfs$status)
+confuse_matrix(pred = coxph_lst[[1]]$os$pred, obs = coxph_lst[[1]]$os$status)
+```
+
+### RSF
+
+```{r}
+## RSF
+library(randomForestSRC)
+rsf_lst <- lapply(c(10), function(tpoints){
+  train_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>%   
+      transmute(Reference_Key, time = time, status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    temp_df_os <- temp_df %>% 
+      transmute(Reference_Key, time, status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  test_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      filter(time <= t) %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>%  
+      transmute(Reference_Key, time , status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    temp_df_os <- temp_df %>% group_by(Reference_Key) %>% filter(time == max(time)) %>% 
+      transmute(Reference_Key, time, status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique()
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  
+  train_mfs <- as.data.frame(train_mfs_os(state_main_2)[[1]])
+  test_mfs <- as.data.frame(test_mfs_os(state_main_open)[[1]])
+  train_os <- as.data.frame(train_mfs_os(state_main_2)[[2]])
+  test_os <- as.data.frame(test_mfs_os(state_main_open)[[2]])
+  
+  run_rsf <- function(df_train,df_test,B = 5000){
+    temp_rsf <- rfsrc(Surv(time, status) ~ ini_age_grp + cci_grp + base_res_grp, 
+                      data = df_train,
+                      ntree = B, membership = T)
+    ## new data
+    pred_lst <- do.call(rbind,lapply(1:nrow(df_test), function(i){
+      pred <- predict(temp_rsf,newdata = df_test[i,c("ini_age_grp", "cci_grp", "base_res_grp")])
+      
+      data.frame(time = pred$time.interest,
+                 pred_surv = round(pred$survival[1,],6)
+      ) %>% 
+        cross_join(df_test[i,c("ini_age_grp", "cci_grp", "base_res_grp")])
+    }))
+    
+    pred_obs <- pred_lst %>% 
+      #mutate(time_c = as.character(round(time,2))) %>% select(-time) %>% 
+      right_join(df_test , 
+                 by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      group_by(Reference_Key) %>% 
+      filter(abs(time.x - time.y) == min(abs(time.x - time.y))) %>% 
+      unique() %>% arrange(Reference_Key) %>% 
+      group_by(Reference_Key) %>% 
+      transmute(Reference_Key, 
+                time = time.x, status, 
+                pred_surv = mean(pred_surv)) %>% unique()
+    
+    return(pred_obs)
+  }
+  roc_mfs <- run_rsf(df_train = train_mfs, df_test = test_mfs)
+  roc_os <- run_rsf(df_train = train_os, df_test = test_os)
+  
+  return(list(mfs = roc_mfs, os = roc_os, time = tpoints))
+})
+
+rsf_lst <- lapply(c(10), function(tpoints){
+  test_mfs_os <- function(ini_df,t = tpoints){
+    temp_df <- ini_df %>% 
+      filter(time <= t) %>% 
+      mutate(mfs_event = factor(state_4, levels = mfs_levels_4st,labels = mfs_labels_4st),
+             os_event = factor(state_4, levels = os_levels_4st, labels = os_labels_4st))
+    
+    temp_df_mfs <- temp_df %>% group_by(Reference_Key) %>% 
+      mutate(type = sum(as.numeric(mfs_event) - 1)) %>% 
+      group_by(Reference_Key, mfs_event) %>% 
+      filter((type == 0 &  time == max(time)) | (type > 0 & as.numeric(mfs_event) == 2 & time == min(time))) %>%  
+      transmute(Reference_Key, 
+                time , 
+                status = as.numeric(mfs_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique() 
+    
+    temp_df_os <- temp_df %>% group_by(Reference_Key) %>% 
+      mutate(type = sum(as.numeric(os_event) - 1)) %>% 
+      group_by(Reference_Key, os_event) %>% 
+      filter((type == 0 &  time == max(time)) | (type > 0 & as.numeric(os_event) == 2 & time == min(time))) %>%  
+      transmute(Reference_Key, 
+                time , 
+                status = as.numeric(os_event)-1,
+                ini_age_grp, cci_grp, base_res_grp) %>% unique() 
+    
+    return(list(temp_df_mfs,temp_df_os))
+  }
+  
+  train_mfs <- as.data.frame(test_mfs_os(state_main_2)[[1]])
+  test_mfs <- as.data.frame(test_mfs_os(state_main_open)[[1]])
+  train_os <- as.data.frame(test_mfs_os(state_main_2)[[2]])
+  test_os <- as.data.frame(test_mfs_os(state_main_open)[[2]])
+  
+  run_rsf <- function(df_train,df_test,B = 5000){
+    temp_rsf <- rfsrc(Surv(time, status) ~ ini_age_grp + cci_grp + base_res_grp, 
+                      data = df_train,
+                      ntree = B, membership = T)
+    ## new data
+    pred_lst <- do.call(rbind,lapply(1:nrow(df_test), function(i){
+      pred <- predict(temp_rsf,newdata = df_test[i,c("ini_age_grp", "cci_grp", "base_res_grp")])
+      
+      data.frame(time = pred$time.interest,
+                 pred_surv = round(pred$survival[1,],6)
+      ) %>% 
+        cross_join(df_test[i,c("ini_age_grp", "cci_grp", "base_res_grp")])
+    }))
+    
+    pred_obs <- pred_lst %>% 
+      #mutate(time_c = as.character(round(time,2))) %>% select(-time) %>% 
+      right_join(df_test , 
+                 by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      group_by(Reference_Key) %>% 
+      filter(abs(time.x - time.y) == min(abs(time.x - time.y))) %>% 
+      unique() %>% arrange(Reference_Key) %>% 
+      group_by(Reference_Key) %>% 
+      transmute(Reference_Key, 
+                time = time.x, status, 
+                pred_surv = mean(pred_surv)) %>% unique()
+    
+    return(pred_obs)
+  }
+  roc_mfs <- run_rsf(df_train = train_mfs, df_test = test_mfs)
+  roc_os <- run_rsf(df_train = train_os, df_test = test_os)
+  
+  return(list(mfs = roc_mfs, os = roc_os, time = tpoints))
+})
+
+##rsf_lst <- readRDS("RSF_lst_.RData")
+saveRDS(rsf_lst, "RSF_lst.RData")
+
+
+c_indx(Hmisc::rcorr.cens(rsf_lst[[1]]$mfs$pred_surv, rsf_lst[[1]]$mfs$status))
+c_indx(Hmisc::rcorr.cens(rsf_lst[[1]]$os$pred_surv, rsf_lst[[1]]$os$status))
+
+confuse_matrix <- function(pred, obs){
+  library(caret)
+  temp <- confusionMatrix(as.factor(ifelse(pred >= 0.5, 1, 0)), as.factor(obs))
+  
+  temp$byClass
+}
+
+confuse_matrix(pred = rsf_lst[[1]]$mfs$pred_surv, obs = rsf_lst[[1]]$mfs$status)
+confuse_matrix(pred = rsf_lst[[1]]$os$pred_surv, obs = rsf_lst[[1]]$os$status)
+
+
+
+```
+
+## Application
+
+### ivdividual time varying transition
+
+```{r}
+## transition evaluation
+## subgroup
+dt = 0.01
+tgrid <- seq(0,10, by = dt)
+
+## level of each group
+lcl_ind <- lapply(c("ini_age_grp", "cci_grp", "base_res_grp"), function(xi){
+  unique(state_main_2[,xi])
+})
+
+## counting weight fro each level of covariates combination
+library(tibble)
+library(randomForestSRC)
+
+  
+weight_null <- data.frame(expand.grid(deframe(lcl_ind[[1]]), 
+                                      deframe(lcl_ind[[2]]), 
+                                      deframe(lcl_ind[[3]])))
+names(weight_null) <- c("ini_age_grp", "cci_grp", "base_res_grp")
+
+weight <- state_main_2 %>% filter(time == 0) %>% 
+  mutate(N = n_distinct(Reference_Key)) %>% 
+  group_by(ini_age_grp, cci_grp, base_res_grp) %>% 
+  summarise(weight = n_distinct(Reference_Key)/N) %>% 
+  mutate(obs_fl = T) %>% 
+  right_join(weight_null, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+  mutate(weight = ifelse(is.na(weight), 0, weight))
+
+each_state_cal <- function(mod, comb = obs_combine, time_points = tgrid, 
+                           tmat = tmat_7states, death_state = 7, subgroup = F){
+  
+  pred.state.ini <- apply(comb, 1, function(comb_i){
+    print(comb_i)
+    
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], 
+                                                 cci_grp = comb_i[2], 
+                                                 base_res_grp = comb_i[3]))
+    probtrans <- probtrans(mf, predt = 0, 
+                           direction = "forward", 
+                           variance = T)
+    
+    death_rate_lst <- do.call(rbind, lapply(1:death_state, function(end_state_i){
+      print(paste("end_state_i", end_state_i))
+      
+      do.call(rbind,lapply(1:(death_state - 1), function(start_state_i){
+        print(paste("start_state_i", start_state_i))
+        
+        sum.probtrans <- summary(probtrans,
+                                 from = start_state_i,
+                                 to = end_state_i)
+        
+        data.frame(ini_state = start_state_i, 
+                   end_state = end_state_i,
+                   ini_age_grp = comb_i[1], 
+                   cci_grp = comb_i[2], 
+                   base_res_grp = comb_i[3], 
+                   time = time_points,
+                   state_rate = sum.probtrans[[start_state_i]][,paste0("pstate",end_state_i)],
+                   state_rate_se = sum.probtrans[[start_state_i]][,paste0("se",end_state_i)],
+                   state_rate_lower = sum.probtrans[[start_state_i]][,paste0("lower",end_state_i)],
+                   state_rate_upper = sum.probtrans[[start_state_i]][,paste0("upper",end_state_i)]) %>% 
+          unique()
+      }))
+    })
+    )
+  })
+  
+  if(subgroup == F){
+    state.total <- do.call(rbind, pred.state.ini) %>% 
+      left_join(weight, 
+                by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      mutate(subgroup = paste(ini_age_grp, cci_grp, base_res_grp)) %>% 
+      unique() %>% 
+      group_by(ini_state, end_state, time) %>% 
+      summarise(weighted_trans_prob = sum(weight * state_rate),
+                weighted_trans_prob_se = sum(weight * state_rate_se),
+                weighted_trans_prob_lower = sum(weight * state_rate_lower),
+                weighted_trans_prob_upper = sum(weight * state_rate_upper))
+  } else {
+    state.total <- do.call(rbind,pred.state.ini) %>% transmute(ini_state, end_state, time, weighted_trans_prob = state_rate)
+  }
+  
+  return(state.total)
+}
+
+## 4-state model
+trans_prob_4states <- each_state_cal(fit_lst_4states_cov[[1]], comb = obs_combine,tmat = tmat_4states, death_state = 4)
+## 7-state model
+trans_prob_7states <- each_state_cal(fit_lst_7states_cov[[1]], comb = obs_combine,tmat = tmat_7states, death_state = 7)
+
+
+fit_lst_4states_cov <- readRDS("./Middle_results/fit_4states_cov_dis_new.RData") # read fit result
+fit_lst_7states_cov <- readRDS("./Middle_results/fit_7states_cov_dis_new.RData") # read fit result
+
+saveRDS(trans_prob_4states, "./Middle_results/trans_prob_4states_new.RData") # this also used for bar plot of prognosis
+saveRDS(trans_prob_7states, "./Middle_results/trans_prob_7states_new.RData")
+
+##
+each_state_cal <- function(mod, comb = obs_combine, time_points = tgrid, tmat = tmat_7states, death_state = 7, subgroup = F){
+  pred.state.ini <- apply(comb, 1, function(comb_i){
+    
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3]))
+    
+    death_rate_lst <- do.call(rbind, lapply(paste0("pstate", 1:death_state), function(end_state_i){
+      do.call(rbind,lapply(1:(death_state - 1), function(start_state_i){
+        data.frame(ini_state = start_state_i, end_state = as.numeric(substr(end_state_i,7,7)),
+                   ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3], time = time_points,
+                   state_rate = probtrans(mf, predt = 0, direction = "forward", variance = F)[[start_state_i]][,end_state_i])
+      }))
+    })
+    )
+  })
+  
+  if(subgroup == F){
+    state.total <- do.call(rbind, pred.state.ini) %>% 
+      left_join(weight, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      mutate(subgroup = paste(ini_age_grp, cci_grp, base_res_grp)) %>% 
+      group_by(ini_state, end_state, time) %>% 
+      summarise(weighted_trans_prob = sum(weight * state_rate))
+  } else {
+    state.total <- do.call(rbind,pred.state.ini) %>% transmute(ini_state, end_state, time, weighted_trans_prob = state_rate)
+  }
+  
+  return(state.total)
+}
+
+
+
+## calculate transition matrix for the mild, severe and weighted average situation
+
+## plot
+breaks_var <- c(4,7)
+labels_lst <- list(c("Localized Hormone Naïve PCa", "Localized PCa", "Metastatic PCa", "Death"),
+                   c("Localized Hormone Naïve PCa", "Metastasis Hormone Sensitive PCa", "Localized Castration Resistance PCa", "Metastasis Castration Resistance PCa", "Localized stable stage", "Metastasis stable stage", "Death"))
+
+stack_plot <- function(df,type){
+  df %>% filter(ini_state == 1) %>% 
+    group_by(end_state, time) %>%
+    summarise(prob = sum(weighted_trans_prob)) %>% 
+    filter(time %in% 0:10) %>% 
+    ggplot(aes(x = time, y = prob, fill = as.factor(end_state)))+
+    geom_bar(position = "stack", stat = "identity")+
+    scale_fill_brewer(palette = "Greens",
+                      name = "States",
+                      breaks = 1:breaks_var[type],
+                      labels = labels_lst[[type]])+
+    scale_x_continuous(breaks = 0:10, labels = c("0",as.character(1:10))) + 
+    xlab("Time post diagnosis(year)") + ylab("Probility") +
+    theme(panel.spacing.x = unit(4, "mm"), text = element_text(size = 15),
+          panel.grid = element_blank(),
+          panel.background = element_rect(fill = "white", colour = "black"),
+          strip.background = element_rect(colour = "black", fill = "white"),
+          strip.text = element_text(face="bold", size=13,lineheight=5.0),
+          legend.key = element_rect(fill = "white", colour = "white"),
+          legend.title = element_text(size=13),
+          legend.text = element_text(size=12))
+}
+
+### mild situation
+each_state_cal <- function(mod, comb = obs_combine, time_points = tgrid, tmat = tmat_7states, death_state = 7, subgroup = F){
+  pred.state.ini <- apply(comb, 1, function(comb_i){
+    
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3]))
+    
+    death_rate_lst <- do.call(rbind, lapply(paste0("pstate", 1:death_state), function(end_state_i){
+      do.call(rbind,lapply(1:(death_state - 1), function(start_state_i){
+        data.frame(ini_state = start_state_i, end_state = as.numeric(substr(end_state_i,7,7)),
+                   ini_age_grp = comb_i[1], cci_grp = comb_i[2], base_res_grp = comb_i[3], time = time_points,
+                   state_rate = probtrans(mf, predt = 0, direction = "forward", variance = F)[[start_state_i]][,end_state_i])
+      }))
+    })
+    )
+  })
+  
+  if(subgroup == F){
+    state.total <- do.call(rbind, pred.state.ini) %>% 
+      left_join(weight, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+      mutate(subgroup = paste(ini_age_grp, cci_grp, base_res_grp)) %>% 
+      group_by(ini_state, end_state, time) %>% 
+      summarise(weighted_trans_prob = sum(weight * state_rate))
+  } else {
+    state.total <- do.call(rbind,pred.state.ini) %>% transmute(ini_state, end_state, time, weighted_trans_prob = state_rate)
+  }
+  
+  return(state.total)
+}
+
+
+lapply(1:2, function(i){
+  
+  temp_fit <-list(fit_lst_4states_cov[[1]],fit_lst_7states_cov[[1]])[[i]]
+  temp_death_state <-c(4,7)[i]
+  tmat_temp <- list(tmat_4states,tmat_7states)[[i]]
+  
+  trans_prob_mild <- each_state_cal(mod = temp_fit, 
+                                  comb = data.frame(ini_age_grp = "<=65", cci_grp = "0", base_res_grp = "<=4"), 
+                                  subgroup = T,tmat = tmat_temp, death_state = temp_death_state)
+
+  saveRDS(trans_prob_mild, paste0("./Middle_results/trans_prob_mild_new_state",temp_death_state,".RData"))
+
+  ### serious situation
+  trans_prob_severe <- each_state_cal(temp_fit, 
+                                      comb = data.frame(ini_age_grp = ">80", cci_grp = ">=3", base_res_grp = ">10"), 
+                                      subgroup = T,tmat = tmat_temp, death_state = temp_death_state)
+  
+  saveRDS(trans_prob_severe, paste0("./Middle_results/trans_prob_severe_new_state",temp_death_state,".RData"))
+
+})
+trans_prob_mild <- each_state_cal(fit_lst_4states_cov[[1]], 
+                                  comb = data.frame(ini_age_grp = "<=65", cci_grp = "0", base_res_grp = "<=4"), 
+                                  subgroup = T,tmat = tmat_4states, death_state = 4)
+
+saveRDS(trans_prob_mild, "./Middle_results/trans_prob_mild_new.RData")
+
+
+### serious situation
+trans_prob_severe <- each_state_cal(fit_lst_4states_cov[[1]], 
+                                    comb = data.frame(ini_age_grp = ">80", cci_grp = ">=3", base_res_grp = ">10"), 
+                                    subgroup = T,tmat = tmat_4states, death_state = 4)
+
+saveRDS(trans_prob_severe, "./Middle_results/trans_prob_severe_new.RData")
+trans_prob_severe <- readRDS("./Middle_results/trans_prob_severe_new.RData")
+
+
+###
+trans_prob_mild_state4 <- readRDS("./Middle_results/trans_prob_mild_new_state4.RData")
+trans_prob_mild_state7 <- readRDS("./Middle_results/trans_prob_mild_new_state7.RData")
+trans_prob_severe_state4 <- readRDS("./Middle_results/trans_prob_severe_new_state4.RData")
+trans_prob_severe_state7 <- readRDS("./Middle_results/trans_prob_severe_new_state7.RData")
+### weighted average
+
+trans_prob_all_4state <- readRDS("./Middle_results/trans_prob_4states_new.RData")
+trans_prob_all_7state <- readRDS("./Middle_results/trans_prob_7states_new.RData")
+
+
+## arrange together
+library(ggpubr)
+
+ggarrange(stack_plot(trans_prob_mild,type = 1), 
+          stack_plot(trans_prob_severe,type = 1), 
+          stack_plot(trans_prob_all_4state,type = 1),
+          labels = c("A", "B", "C"),
+          common.legend = T,legend = "bottom",
+          ncol = 3, nrow = 1)
+
+ggarrange(stack_plot(trans_prob_mild_state4,type = 1), 
+          stack_plot(trans_prob_severe_state4,type = 1), 
+          stack_plot(trans_prob_all_4state,type = 1),
+          stack_plot(trans_prob_mild_state7,type = 2), 
+          stack_plot(trans_prob_severe_state7,type = 2), 
+          stack_plot(trans_prob_all_7state,type = 2),
+          labels = c("A", "B", "C"),
+          common.legend = T,legend = "right",
+          ncol = 3, nrow = 2)
+
+ggarrange(stack_plot(trans_prob_mild_state7,type = 1), 
+          stack_plot(trans_prob_severe_state7,type = 1), 
+          stack_plot(trans_prob_all_7state,type = 1),
+          labels = c("A", "B", "C"),
+          common.legend = T,legend = "bottom",
+          ncol = 3, nrow = 1)
+
+
+ggsave("C:\\Users\\JiaQi\\OneDrive - The University Of Hong Kong\\Desktop\\PC_writting\\Results\\progression_plot_4state.tiff")
+
+## gen table
+transprob <- rbind(data.frame(trans_prob_mild_state4, type = "1", model = "4"),
+      data.frame(trans_prob_mild_state7, type = "1", model = "7"),
+      data.frame(trans_prob_severe_state4, type = "2", model = "4"),
+      data.frame(trans_prob_severe_state7, type = "2", model = "7"),
+      data.frame(trans_prob_all_4state, type = "3", model = "4"),
+      data.frame(trans_prob_all_7state, type = "3", model = "7")) %>% 
+  filter(time %in% c(1,3,5,10)) %>% 
+  filter(ini_state == 1) %>% 
+  group_by(model, end_state, time, type) %>%
+  summarise(prob = sum(weighted_trans_prob))  %>% 
+  pivot_wider(names_from = end_state, values_from = prob)
+
+transprob
+write.csv(transprob, "transprob.csv")
+```
+
+
+### Calculating Mortality Risk
+
+Results from time-nonhomo fitting are used to calculated the mortality risk.
+
+```{r death_risk_cal_4state}
+
+dt = 0.01
+tgrid <- seq(0,10, by = dt)
+death_risk_cal <- function(mod, comb = obs_combine, time_points = tgrid, tmat = tmat_7states, death_state = 7){
+  
+  pstate <- paste0("pstate",death_state)
+  se <- paste0("se",death_state)
+  lower <- paste0("lower",death_state)
+  upper <- paste0("upper",death_state)
+  
+  
+  pred.death.ini <- apply(comb, 1, function(comb_i){
+    print(comb_i)
+
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], 
+                                                 cci_grp = comb_i[2], 
+                                                 base_res_grp = comb_i[3]))
+
+    probtrans <- probtrans(mf, predt = 0, direction = "forward", 
+                           variance = T)
+    
+    death_rate <- do.call(rbind,lapply(1:(death_state-1), function(start_state_i){
+      print(paste("starting state:", start_state_i))
+      
+      sum.probtrans <- summary(probtrans,
+                               from = start_state_i)
+
+      data.frame(ini_state = start_state_i,
+                 ini_age_grp = comb_i[1], 
+                 cci_grp = comb_i[2], 
+                 base_res_grp =comb_i[3], 
+                 time = time_points,
+                 death_rate = sum.probtrans[[start_state_i]][,pstate],
+                 death_rate_se = sum.probtrans[[start_state_i]][,se],
+                 death_rate_lower = sum.probtrans[[start_state_i]][,lower],
+                 death_rate_upper = sum.probtrans[[start_state_i]][,upper])
+    }))
+    return(death_rate)
+  })
+  
+  # weighted average of subgroup
+  death.total <- do.call(rbind, pred.death.ini) %>% 
+    left_join(weight, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+    mutate(subgroup = paste(ini_age_grp, cci_grp, base_res_grp)) %>% 
+    group_by(time, ini_state) %>% 
+    mutate(death.rate.total = sum(death_rate * weight),
+           death.rate.total.lower = sum(death_rate_lower * weight),
+           death.rate.total.upper = sum(death_rate_upper * weight)) %>% # weighted averaged
+    unique()
+  
+  return(death.total)
+}
+
+## 4 state model
+death.total <- death_risk_cal(mod = fit_lst_4states_cov[[1]], tmat = tmat_4states, death_state = 4)
+
+## checking
+death.total %>% filter(death.rate.total > 1|death.rate.total.upper > 1 | death.rate.total.lower > 1)
+## saving
+saveRDS(death.total, "./Middle_results/pred_death_risk_total_4states_CI.RData")
+
+## output
+death_risk <- death.total %>% filter(ini_state == 1) %>% 
+  group_by(subgroup) %>% filter(time == max(time)) %>% ungroup() %>% 
+  transmute(base_res_grp, cci_grp, ini_age_grp, death_rate, death_rate_lower, death_rate_upper) %>% 
+  pivot_wider(values_from = c(death_rate, death_rate_lower, death_rate_upper), names_from = ini_age_grp)
+
+write.csv(death_risk, "death_risk_results.csv")
+
+## 7 state model
+death_risk_cal_ <- function(mod, comb = obs_combine, time_points = tgrid, tmat = tmat_7states, death_state = 7){
+  
+  pstate <- paste0("pstate",death_state)
+  se <- paste0("se",death_state)
+  lower <- paste0("lower",death_state)
+  upper <- paste0("upper",death_state)
+  
+  
+  pred.death.ini <- apply(comb, 1, function(comb_i){
+    print(comb_i)
+    
+    mf <- msfit.flexsurvreg(mod, t = time_points, 
+                            trans = tmat, 
+                            newdata = data.frame(ini_age_grp = comb_i[1], 
+                                                 cci_grp = comb_i[2], 
+                                                 base_res_grp = comb_i[3]))
+    
+    probtrans <- probtrans(mf, predt = 0, direction = "forward", 
+                           variance = T)
+    
+    death_rate <- do.call(rbind,lapply(1, function(start_state_i){
+      print(paste("starting state:", start_state_i))
+      
+      sum.probtrans <- probtrans
+      
+      data.frame(ini_state = start_state_i,
+                 ini_age_grp = comb_i[1], 
+                 cci_grp = comb_i[2], 
+                 base_res_grp =comb_i[3], 
+                 time = time_points,
+                 death_rate = sum.probtrans[[start_state_i]][,pstate],
+                 death_rate_se = sum.probtrans[[start_state_i]][,se])
+    }))
+    return(death_rate)
+  })
+  
+  death.total <- do.call(rbind, pred.death.ini) %>% 
+    left_join(weight, by = c("ini_age_grp", "cci_grp", "base_res_grp")) %>% 
+    mutate(subgroup = paste(ini_age_grp, cci_grp, base_res_grp)) %>% 
+    group_by(time, ini_state) %>% 
+    mutate(death.rate.total = sum(death_rate * weight)) %>% # weighted averaged
+    unique()
+  
+  return(death.total)
+}
+death.total.7 <- death_risk_cal_(mod = fit_lst_7states_cov[[1]], tmat = tmat_7states, death_state = 7)
+
+death_risk.7 <- death.total.7 %>% filter(ini_state == 1) %>% 
+  group_by(subgroup) %>% filter(time == max(time)) %>% ungroup() %>% 
+  transmute(base_res_grp, cci_grp, ini_age_grp, death_rate) %>% 
+  pivot_wider(values_from = c(death_rate), names_from = ini_age_grp)
+
+write.csv(death_risk.7, "death_risk_results.7.csv")
+```
+
+
